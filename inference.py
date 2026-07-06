@@ -3,45 +3,23 @@ import yaml
 import torch
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
-import torchvision.transforms as T
-import torchvision.transforms.functional as f
-
 from tqdm import tqdm
-from PIL import Image
-from matplotlib.patches import Polygon
 
 from model.cls_hrnet import get_cls_net
 from model.cls_hrnet_l import get_cls_net as get_cls_net_l
+from utils.utils_calib import FramebyFrameCalib
+from utils.utils_heatmap import get_keypoints_from_heatmap_batch_maxpool, get_keypoints_from_heatmap_batch_maxpool_l, complete_keypoints, coords_to_dict
 
-from utils.utils_calib import FramebyFrameCalib, pan_tilt_roll_to_orientation
-from utils.utils_heatmap import get_keypoints_from_heatmap_batch_maxpool, get_keypoints_from_heatmap_batch_maxpool_l, \
-    complete_keypoints, coords_to_dict
+torch.backends.cudnn.benchmark = True # Crucial for static batch sizes
 
-
-lines_coords = [[[0., 54.16, 0.], [16.5, 54.16, 0.]],
-                [[16.5, 13.84, 0.], [16.5, 54.16, 0.]],
-                [[16.5, 13.84, 0.], [0., 13.84, 0.]],
-                [[88.5, 54.16, 0.], [105., 54.16, 0.]],
-                [[88.5, 13.84, 0.], [88.5, 54.16, 0.]],
-                [[88.5, 13.84, 0.], [105., 13.84, 0.]],
-                [[0., 37.66, -2.44], [0., 30.34, -2.44]],
-                [[0., 37.66, 0.], [0., 37.66, -2.44]],
-                [[0., 30.34, 0.], [0., 30.34, -2.44]],
-                [[105., 37.66, -2.44], [105., 30.34, -2.44]],
-                [[105., 30.34, 0.], [105., 30.34, -2.44]],
-                [[105., 37.66, 0.], [105., 37.66, -2.44]],
-                [[52.5, 0., 0.], [52.5, 68, 0.]],
-                [[0., 68., 0.], [105., 68., 0.]],
-                [[0., 0., 0.], [0., 68., 0.]],
-                [[105., 0., 0.], [105., 68., 0.]],
-                [[0., 0., 0.], [105., 0., 0.]],
-                [[0., 43.16, 0.], [5.5, 43.16, 0.]],
-                [[5.5, 43.16, 0.], [5.5, 24.84, 0.]],
-                [[5.5, 24.84, 0.], [0., 24.84, 0.]],
-                [[99.5, 43.16, 0.], [105., 43.16, 0.]],
-                [[99.5, 43.16, 0.], [99.5, 24.84, 0.]],
-                [[99.5, 24.84, 0.], [105., 24.84, 0.]]]
+lines_coords = [[[0., 54.16, 0.], [16.5, 54.16, 0.]], [[16.5, 13.84, 0.], [16.5, 54.16, 0.]], [[16.5, 13.84, 0.], [0., 13.84, 0.]],
+                [[88.5, 54.16, 0.], [105., 54.16, 0.]], [[88.5, 13.84, 0.], [88.5, 54.16, 0.]], [[88.5, 13.84, 0.], [105., 13.84, 0.]],
+                [[0., 37.66, -2.44], [0., 30.34, -2.44]], [[0., 37.66, 0.], [0., 37.66, -2.44]], [[0., 30.34, 0.], [0., 30.34, -2.44]],
+                [[105., 37.66, -2.44], [105., 30.34, -2.44]], [[105., 30.34, 0.], [105., 30.34, -2.44]], [[105., 37.66, 0.], [105., 37.66, -2.44]],
+                [[52.5, 0., 0.], [52.5, 68, 0.]], [[0., 68., 0.], [105., 68., 0.]], [[0., 0., 0.], [0., 68., 0.]],
+                [[105., 0., 0.], [105., 68., 0.]], [[0., 0., 0.], [105., 0., 0.]], [[0., 43.16, 0.], [5.5, 43.16, 0.]],
+                [[5.5, 43.16, 0.], [5.5, 24.84, 0.]], [[5.5, 24.84, 0.], [0., 24.84, 0.]], [[99.5, 43.16, 0.], [105., 43.16, 0.]],
+                [[99.5, 43.16, 0.], [99.5, 24.84, 0.]], [[99.5, 24.84, 0.], [105., 24.84, 0.]]]
 
 
 def projection_from_cam_params(final_params_dict):
@@ -51,48 +29,16 @@ def projection_from_cam_params(final_params_dict):
     principal_point = np.array(cam_params['principal_point'])
     position_meters = np.array(cam_params['position_meters'])
     rotation = np.array(cam_params['rotation_matrix'])
-
     It = np.eye(4)[:-1]
     It[:, -1] = -position_meters
-    Q = np.array([[x_focal_length, 0, principal_point[0]],
-                  [0, y_focal_length, principal_point[1]],
-                  [0, 0, 1]])
+    Q = np.array([[x_focal_length, 0, principal_point[0]], [0, y_focal_length, principal_point[1]], [0, 0, 1]])
     P = Q @ (rotation @ It)
-
     return P
 
 
-def inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine):
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame = Image.fromarray(frame)
-
-    frame = f.to_tensor(frame).float().unsqueeze(0)
-    _, _, h_original, w_original = frame.size()
-    frame = frame if frame.size()[-1] == 960 else transform2(frame)
-    frame = frame.to(device)
-    b, c, h, w = frame.size()
-
-    with torch.no_grad():
-        heatmaps = model(frame)
-        heatmaps_l = model_l(frame)
-
-    kp_coords = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
-    line_coords = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
-    kp_dict = coords_to_dict(kp_coords, threshold=kp_threshold)
-    lines_dict = coords_to_dict(line_coords, threshold=line_threshold)
-    kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=w, h=h, normalize=True)
-
-    cam.update(kp_dict, lines_dict)
-    final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
-
-    return final_params_dict
-
-
 def project(frame, P):
-
     for line in lines_coords:
-        w1 = line[0]
-        w2 = line[1]
+        w1, w2 = line[0], line[1]
         i1 = P @ np.array([w1[0]-105/2, w1[1]-68/2, w1[2], 1])
         i2 = P @ np.array([w2[0]-105/2, w2[1]-68/2, w2[2], 1])
         i1 /= i1[-1]
@@ -104,40 +50,64 @@ def project(frame, P):
     base_pos = np.array([11-105/2, 68/2-68/2, 0., 0.])
     for ang in np.linspace(37, 143, 50):
         ang = np.deg2rad(ang)
-        pos = base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.])
-        ipos = P @ pos
-        ipos /= ipos[-1]
-        pts1.append([ipos[0], ipos[1]])
+        ipos = P @ (base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.]))
+        pts1.append([ipos[0]/ipos[-1], ipos[1]/ipos[-1]])
 
     base_pos = np.array([94-105/2, 68/2-68/2, 0., 0.])
     for ang in np.linspace(217, 323, 200):
         ang = np.deg2rad(ang)
-        pos = base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.])
-        ipos = P @ pos
-        ipos /= ipos[-1]
-        pts2.append([ipos[0], ipos[1]])
+        ipos = P @ (base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.]))
+        pts2.append([ipos[0]/ipos[-1], ipos[1]/ipos[-1]])
 
     base_pos = np.array([0, 0, 0., 0.])
     for ang in np.linspace(0, 360, 500):
         ang = np.deg2rad(ang)
-        pos = base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.])
-        ipos = P @ pos
-        ipos /= ipos[-1]
-        pts3.append([ipos[0], ipos[1]])
+        ipos = P @ (base_pos + np.array([r*np.sin(ang), r*np.cos(ang), 0., 1.]))
+        pts3.append([ipos[0]/ipos[-1], ipos[1]/ipos[-1]])
 
-    XEllipse1 = np.array(pts1, np.int32)
-    XEllipse2 = np.array(pts2, np.int32)
-    XEllipse3 = np.array(pts3, np.int32)
-    frame = cv2.polylines(frame, [XEllipse1], False, (255, 0, 0), 3)
-    frame = cv2.polylines(frame, [XEllipse2], False, (255, 0, 0), 3)
-    frame = cv2.polylines(frame, [XEllipse3], False, (255, 0, 0), 3)
-
+    frame = cv2.polylines(frame, [np.array(pts1, np.int32)], False, (255, 0, 0), 3)
+    frame = cv2.polylines(frame, [np.array(pts2, np.int32)], False, (255, 0, 0), 3)
+    frame = cv2.polylines(frame, [np.array(pts3, np.int32)], False, (255, 0, 0), 3)
     return frame
 
 
-def process_input(input_path, input_type, model_kp, model_line, kp_threshold, line_threshold, pnl_refine,
-                  save_path, display):
+def process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out):
+    # 1. Stack all frames into a single tensor and push to GPU in FP16
+    batch_tensor = torch.stack(frames_buffer).to(device).half()
+    
+    # 2. Network Inference (Processes ALL frames at once)
+    with torch.inference_mode():
+        heatmaps = model_kp(batch_tensor).float() # Cast back to float32 for metric calculations
+        heatmaps_l = model_line(batch_tensor).float()
 
+    # 3. Extract coordinates for the entire batch
+    kp_coords_batch = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
+    line_coords_batch = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
+
+    # 4. Sequentially run the calibration logic (preserves temporal tracking)
+    for i in range(len(raw_frames_buffer)):
+        raw_frame = raw_frames_buffer[i]
+        
+        # FIX: Use [i:i+1] to keep it a PyTorch tensor instead of a Python list
+        kp_dict = coords_to_dict(kp_coords_batch[i:i+1], threshold=kp_threshold)
+        lines_dict = coords_to_dict(line_coords_batch[i:i+1], threshold=line_threshold)
+        
+        kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=960, h=540, normalize=True)
+
+        cam.update(kp_dict, lines_dict)
+        final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
+
+        if final_params_dict is not None:
+            P = projection_from_cam_params(final_params_dict)
+            projected_frame = project(raw_frame, P)
+        else:
+            projected_frame = raw_frame
+            
+        if out is not None:
+            out.write(projected_frame)
+
+
+def process_video(input_path, save_path, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, batch_size):
     cap = cv2.VideoCapture(input_path)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -145,105 +115,75 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
     cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
+    out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height)) if save_path else None
 
-    if input_type == 'video':
-        cap = cv2.VideoCapture(input_path)
-        if save_path != "":
-            out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
+    frames_buffer = []
+    raw_frames_buffer = []
 
-        pbar = tqdm(total=total_frames)
+    pbar = tqdm(total=total_frames)
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
-            if final_params_dict is not None:
-                P = projection_from_cam_params(final_params_dict)
-                projected_frame = project(frame, P)
-            else:
-                projected_frame = frame
-                
-            if save_path != "":
-                out.write(projected_frame)
-    
-            if display:
-                cv2.imshow('Projected Frame', projected_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            
-            pbar.update(1)
+        raw_frames_buffer.append(frame)
 
-        cap.release()
-        if save_path != "":
-            out.release()
-        cv2.destroyAllWindows()
-
-    elif input_type == 'image':
-        frame = cv2.imread(input_path)
-        if frame is None:
-            print(f"Error: Unable to read the image {input_path}")
-            return
-
-        final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
-        if final_params_dict is not None:
-            P = projection_from_cam_params(final_params_dict)
-            projected_frame = project(frame, P)
+        # Pure OpenCV preprocessing
+        if frame.shape[1] != 960 or frame.shape[0] != 540:
+            frame_resized = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
         else:
-            projected_frame = frame
+            frame_resized = frame
 
-        if save_path != "":
-            cv2.imwrite(save_path, projected_frame)
-        else:
-            plt.imshow(cv2.cvtColor(projected_frame, cv2.COLOR_BGR2RGB))
-            plt.axis('off')
-            plt.show()
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        input_np = frame_rgb.astype(np.float32) / 255.0
+        input_np = np.transpose(input_np, (2, 0, 1))
+        
+        frames_buffer.append(torch.from_numpy(input_np))
+
+        # Process when batch is full
+        if len(frames_buffer) == batch_size:
+            process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
+            pbar.update(batch_size)
+            frames_buffer.clear()
+            raw_frames_buffer.clear()
+
+    # Process remaining frames
+    if len(frames_buffer) > 0:
+        process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
+        pbar.update(len(frames_buffer))
+
+    cap.release()
+    if out:
+        out.release()
+
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(description="Process video or image and plot lines on each frame.")
-    parser.add_argument("--weights_kp", type=str, help="Path to the model for keypoint inference.")
-    parser.add_argument("--weights_line", type=str, help="Path to the model for line projection.")
-    parser.add_argument("--kp_threshold", type=float, default=0.3434, help="Threshold for keypoint detection.")
-    parser.add_argument("--line_threshold", type=float, default=0.7867, help="Threshold for line detection.")
-    parser.add_argument("--pnl_refine", action="store_true", help="Enable PnL refinement module.")
-    parser.add_argument("--device", type=str, default="cuda:0", help="CPU or CUDA device index")
-    parser.add_argument("--input_path", type=str, required=True, help="Path to the input video or image file.")
-    parser.add_argument("--input_type", type=str, choices=['video', 'image'], required=True,
-                        help="Type of input: 'video' or 'image'.")
-    parser.add_argument("--save_path", type=str, default="", help="Path to save the processed video.")
-    parser.add_argument("--display", action="store_true", help="Enable real-time display.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights_kp", type=str, required=True, help="Path to PyTorch keypoint weights")
+    parser.add_argument("--weights_line", type=str, required=True, help="Path to PyTorch line weights")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of frames to process at once")
+    parser.add_argument("--kp_threshold", type=float, default=0.3434)
+    parser.add_argument("--line_threshold", type=float, default=0.7867)
+    parser.add_argument("--pnl_refine", action="store_true")
+    parser.add_argument("--input_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, default="")
     args = parser.parse_args()
 
+    device = torch.device("cuda:0")
 
-    input_path = args.input_path
-    input_type = args.input_type
-    model_kp = args.weights_kp
-    model_line = args.weights_line
-    pnl_refine = args.pnl_refine
-    save_path = args.save_path
-    device = args.device
-    display = args.display and input_type == 'video'
-    kp_threshold = args.kp_threshold
-    line_threshold = args.line_threshold
+    # Load configs and original PyTorch weights
+    cfg = yaml.safe_load(open("/content/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
+    cfg_l = yaml.safe_load(open("/content/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
 
-    cfg = yaml.safe_load(open("config/hrnetv2_w48.yaml", 'r'))
-    cfg_l = yaml.safe_load(open("config/hrnetv2_w48_l.yaml", 'r'))
+    print("Loading PyTorch Models to GPU in FP16...")
+    model_kp = get_cls_net(cfg).to(device).half()
+    model_kp.load_state_dict(torch.load(args.weights_kp, map_location=device))
+    model_kp.eval()
 
-    loaded_state = torch.load(args.weights_kp, map_location=device)
-    model = get_cls_net(cfg)
-    model.load_state_dict(loaded_state)
-    model.to(device)
-    model.eval()
+    model_line = get_cls_net_l(cfg_l).to(device).half()
+    model_line.load_state_dict(torch.load(args.weights_line, map_location=device))
+    model_line.eval()
+    print("Models Loaded. Starting Batch Processing!")
 
-    loaded_state_l = torch.load(args.weights_line, map_location=device)
-    model_l = get_cls_net_l(cfg_l)
-    model_l.load_state_dict(loaded_state_l)
-    model_l.to(device)
-    model_l.eval()
-
-    transform2 = T.Resize((540, 960))
-
-    process_input(input_path, input_type, model_kp, model_line, kp_threshold, line_threshold, pnl_refine,
-                  save_path, display)
+    process_video(args.input_path, args.save_path, model_kp, model_line, args.kp_threshold, args.line_threshold, args.pnl_refine, device, args.batch_size)
