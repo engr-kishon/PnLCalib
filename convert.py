@@ -1,3 +1,4 @@
+import argparse
 import torch
 import yaml
 from model.cls_hrnet import get_cls_net
@@ -36,20 +37,32 @@ def export_to_onnx(model_path, config_path, is_line_model, output_name):
     print("Done!\n")
 
 if __name__ == "__main__":
-    # Ensure you change "SV_kp" and "SV_lines" to the exact paths of your downloaded files
+    parser = argparse.ArgumentParser(description="Export PnLCalib models to ONNX format.")
+    
+    # Keypoint Model Arguments
+    parser.add_argument("--kp_model", type=str, required=True, help="Path to Keypoint model weights")
+    parser.add_argument("--kp_config", type=str, required=True, help="Path to Keypoint model config (yaml)")
+    parser.add_argument("--kp_out", type=str, default="keypoint_model.onnx", help="Output filename for Keypoint ONNX model")
+    
+    # Line Model Arguments
+    parser.add_argument("--line_model", type=str, required=True, help="Path to Line model weights")
+    parser.add_argument("--line_config", type=str, required=True, help="Path to Line model config (yaml)")
+    parser.add_argument("--line_out", type=str, default="line_model.onnx", help="Output filename for Line ONNX model")
+
+    args = parser.parse_args()
     
     # 1. Export the Keypoints Model
     export_to_onnx(
-        model_path="/content/SV_kp", 
-        config_path="/content/PnLCalib/config/hrnetv2_w48.yaml", 
+        model_path=args.kp_model, 
+        config_path=args.kp_config, 
         is_line_model=False, 
-        output_name="keypoint_model.onnx"
+        output_name=args.kp_out
     )
 
     # 2. Export the Lines Model
     export_to_onnx(
-        model_path="/content/SV_lines", 
-        config_path="/content/PnLCalib/config/hrnetv2_w48_l.yaml", 
+        model_path=args.line_model, 
+        config_path=args.line_config, 
         is_line_model=True, 
-        output_name="line_model.onnx"
+        output_name=args.line_out
     )
