@@ -173,8 +173,8 @@ if __name__ == "__main__":
     device = torch.device("cuda:0")
 
     # Load configs and original PyTorch weights
-    cfg = yaml.safe_load(open("/content/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
-    cfg_l = yaml.safe_load(open("/content/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
+    cfg = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
+    cfg_l = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
 
     print("Loading PyTorch Models to GPU in FP16...")
     model_kp = get_cls_net(cfg).to(device).half()
