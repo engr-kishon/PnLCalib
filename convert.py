@@ -23,16 +23,21 @@ def export_to_onnx(model_path, config_path, is_line_model, output_name):
     # The inference script resizes images to 540x960, so we use that for the dummy input
     dummy_input = torch.randn(1, 3, 540, 960)
 
-    print(f"Exporting to {output_name}...")
+    print(f"Exporting to {output_name} with dynamic batching...")
     torch.onnx.export(
         model, 
         dummy_input, 
         output_name, 
         export_params=True,
-        opset_version=12,          # Opset 12 is highly stable for TensorRT conversion
+        opset_version=12,
         do_constant_folding=True,
         input_names=['input'], 
-        output_names=['output']
+        output_names=['output'],
+        # NEW: This tells ONNX that the 0th dimension (batch) can change in size
+        dynamic_axes={
+            'input': {0: 'batch_size'},
+            'output': {0: 'batch_size'}
+        }
     )
     print("Done!\n")
 
