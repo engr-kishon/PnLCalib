@@ -37,6 +37,7 @@ def projection_from_cam_params(final_params_dict):
 
 
 def project(frame, P):
+    # Projects the 3D lines onto the broadcast camera view
     for line in lines_coords:
         w1, w2 = line[0], line[1]
         i1 = P @ np.array([w1[0]-105/2, w1[1]-68/2, w1[2], 1])
@@ -71,170 +72,71 @@ def project(frame, P):
     return frame
 
 
+def draw_pitch_template(width=1050, height=680):
+    # Generates a scaled 2D football pitch background
+    pitch = np.full((height, width, 3), (0, 100, 0), dtype=np.uint8)
+    color = (255, 255, 255) # White lines
+    thickness = 2
+    
+    cv2.rectangle(pitch, (0, 0), (width, height), color, thickness)
+    cv2.line(pitch, (width//2, 0), (width//2, height), color, thickness)
+    cv2.circle(pitch, (width//2, height//2), 91, color, thickness)
+    
+    pen_w, pen_h = 165, 403
+    cv2.rectangle(pitch, (0, height//2 - pen_h//2), (pen_w, height//2 + pen_h//2), color, thickness)
+    cv2.rectangle(pitch, (width - pen_w, height//2 - pen_h//2), (width, height//2 + pen_h//2), color, thickness)
+    
+    goal_w, goal_h = 55, 183
+    cv2.rectangle(pitch, (0, height//2 - goal_h//2), (goal_w, height//2 + goal_h//2), color, thickness)
+    cv2.rectangle(pitch, (width - goal_w, height//2 - goal_h//2), (width, height//2 + goal_h//2), color, thickness)
+    
+    return pitch
+
+
 def generate_top_down_view(frame, P, pitch_width=1050, pitch_height=680):
-    """
-    Generates a 2D Homography Tactical Map by mathematically flattening
-    the broadcast perspective onto a 2D canvas.
-    """
     H = np.zeros((3, 3))
     H[:, 0] = P[:, 0]
     H[:, 1] = P[:, 1]
     H[:, 2] = P[:, 3]
 
+    # The scale factor (10 pixels = 1 meter)
+    scale_factor = 10
+    scale_matrix = np.array([
+        [scale_factor, 0, 0],
+        [0, scale_factor, 0],
+        [0, 0, 1]
+    ])
+
+    # Center the pitch origin (0,0) to the middle of the image
     shift_matrix = np.array([
         [1, 0, pitch_width / 2],
         [0, 1, pitch_height / 2],
         [0, 0, 1]
     ])
     
+    # Final Transformation: Invert -> Scale up -> Shift to center
     H_inv = np.linalg.inv(H)
-    H_final = shift_matrix @ H_inv
+    H_final = shift_matrix @ scale_matrix @ H_inv
 
+    # Generate the pristine 2D pitch template
+    tactical_map = draw_pitch_template(pitch_width, pitch_height)
+
+    # Warp the broadcast frame and lay it transparently over the pitch map
     top_down_frame = cv2.warpPerspective(
         frame, 
         H_final, 
         (pitch_width, pitch_height), 
+        dst=tactical_map,                 # Draw ON TOP of our new pitch template
         flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 100, 0) # Fill background with a dark green
+        borderMode=cv2.BORDER_TRANSPARENT # Keeps the rest of the pitch template visible
     )
+    
     return top_down_frame
 
 
 def process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out):
-    # 1. Stack all frames into a single tensor and push to GPU in FP16
+    # Process the batch simultaneously
     batch_tensor = torch.stack(frames_buffer).to(device).half()
     
-    # 2. Network Inference (Processes ALL frames at once)
     with torch.inference_mode():
-        heatmaps = model_kp(batch_tensor).float() # Cast back to float32 for metric calculations
-        heatmaps_l = model_line(batch_tensor).float()
-
-    # 3. Extract coordinates for the entire batch
-    kp_coords_batch = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
-    line_coords_batch = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
-
-    # 4. Sequentially run the calibration logic (preserves temporal tracking)
-    for i in range(len(raw_frames_buffer)):
-        raw_frame = raw_frames_buffer[i]
-        
-        # Use [i:i+1] to keep it a PyTorch tensor instead of a Python list
-        kp_dict = coords_to_dict(kp_coords_batch[i:i+1], threshold=kp_threshold)
-        lines_dict = coords_to_dict(line_coords_batch[i:i+1], threshold=line_threshold)
-        
-        kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=960, h=540, normalize=True)
-
-        cam.update(kp_dict, lines_dict)
-        final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
-
-        if final_params_dict is not None:
-            P = projection_from_cam_params(final_params_dict)
-            
-            # Draw the 3D lines onto a copy of the broadcast frame
-            projected_frame = project(raw_frame.copy(), P)
-            
-            # Generate the flat 2D homography map
-            top_down_view = generate_top_down_view(raw_frame, P)
-            
-            # Resize the 2D map to match the height of the broadcast frame
-            h1, w1 = projected_frame.shape[:2]
-            h2, w2 = top_down_view.shape[:2]
-            scaling_factor = h1 / h2
-            top_down_resized = cv2.resize(top_down_view, (int(w2 * scaling_factor), h1))
-            
-            # Stitch them side-by-side!
-            final_output = np.hstack((projected_frame, top_down_resized))
-            
-        else:
-            final_output = raw_frame
-            
-        if out is not None:
-            out.write(final_output)
-
-
-def process_video(input_path, save_path, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, batch_size):
-    cap = cv2.VideoCapture(input_path)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-
-    cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
-    
-    # Calculate the combined width for the side-by-side VideoWriter output
-    map_aspect_ratio = 1050 / 680
-    map_width = int(frame_height * map_aspect_ratio)
-    combined_width = frame_width + map_width
-    
-    out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (combined_width, frame_height)) if save_path else None
-
-    frames_buffer = []
-    raw_frames_buffer = []
-
-    pbar = tqdm(total=total_frames)
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        raw_frames_buffer.append(frame)
-
-        # Pure OpenCV preprocessing
-        if frame.shape[1] != 960 or frame.shape[0] != 540:
-            frame_resized = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
-        else:
-            frame_resized = frame
-
-        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        input_np = frame_rgb.astype(np.float32) / 255.0
-        input_np = np.transpose(input_np, (2, 0, 1))
-        
-        frames_buffer.append(torch.from_numpy(input_np))
-
-        # Process when batch is full
-        if len(frames_buffer) == batch_size:
-            process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
-            pbar.update(batch_size)
-            frames_buffer.clear()
-            raw_frames_buffer.clear()
-
-    # Process remaining frames
-    if len(frames_buffer) > 0:
-        process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
-        pbar.update(len(frames_buffer))
-
-    cap.release()
-    if out:
-        out.release()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--weights_kp", type=str, required=True, help="Path to PyTorch keypoint weights")
-    parser.add_argument("--weights_line", type=str, required=True, help="Path to PyTorch line weights")
-    parser.add_argument("--batch_size", type=int, default=4, help="Number of frames to process at once")
-    parser.add_argument("--kp_threshold", type=float, default=0.3434)
-    parser.add_argument("--line_threshold", type=float, default=0.7867)
-    parser.add_argument("--pnl_refine", action="store_true")
-    parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--save_path", type=str, default="")
-    args = parser.parse_args()
-
-    device = torch.device("cuda:0")
-
-    # Load configs and original PyTorch weights
-    cfg = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
-    cfg_l = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
-
-    print("Loading PyTorch Models to GPU in FP16...")
-    model_kp = get_cls_net(cfg).to(device).half()
-    model_kp.load_state_dict(torch.load(args.weights_kp, map_location=device))
-    model_kp.eval()
-
-    model_line = get_cls_net_l(cfg_l).to(device).half()
-    model_line.load_state_dict(torch.load(args.weights_line, map_location=device))
-    model_line.eval()
-    print("Models Loaded. Starting Batch Processing!")
-
-    process_video(args.input_path, args.save_path, model_kp, model_line, args.kp_threshold, args.line_threshold, args.pnl_refine, device, args.batch_size)
+        heatmaps = model_kp(batch_
