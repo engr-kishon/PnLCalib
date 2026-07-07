@@ -139,4 +139,127 @@ def process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, k
     batch_tensor = torch.stack(frames_buffer).to(device).half()
     
     with torch.inference_mode():
-        heatmaps = model_kp(batch_
+        heatmaps = model_kp(batch_tensor).float() 
+        heatmaps_l = model_line(batch_tensor).float()
+
+    kp_coords_batch = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
+    line_coords_batch = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
+
+    # Sequentially track and map frames
+    for i in range(len(raw_frames_buffer)):
+        raw_frame = raw_frames_buffer[i]
+        
+        kp_dict = coords_to_dict(kp_coords_batch[i:i+1], threshold=kp_threshold)
+        lines_dict = coords_to_dict(line_coords_batch[i:i+1], threshold=line_threshold)
+        kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=960, h=540, normalize=True)
+
+        cam.update(kp_dict, lines_dict)
+        final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
+
+        if final_params_dict is not None:
+            P = projection_from_cam_params(final_params_dict)
+            
+            # Broadcast feed with 3D lines
+            projected_frame = project(raw_frame.copy(), P)
+            
+            # Flat 2D tactical map
+            top_down_view = generate_top_down_view(raw_frame, P)
+            
+            # Match heights and stitch together
+            h1, w1 = projected_frame.shape[:2]
+            h2, w2 = top_down_view.shape[:2]
+            scaling_factor = h1 / h2
+            top_down_resized = cv2.resize(top_down_view, (int(w2 * scaling_factor), h1))
+            
+            final_output = np.hstack((projected_frame, top_down_resized))
+            
+        else:
+            final_output = raw_frame
+            
+        if out is not None:
+            out.write(final_output)
+
+
+def process_video(input_path, save_path, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, batch_size):
+    cap = cv2.VideoCapture(input_path)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+    cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
+    
+    # Calculate output width to accommodate the side-by-side stitch
+    map_aspect_ratio = 1050 / 680
+    map_width = int(frame_height * map_aspect_ratio)
+    combined_width = frame_width + map_width
+    
+    out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (combined_width, frame_height)) if save_path else None
+
+    frames_buffer = []
+    raw_frames_buffer = []
+
+    pbar = tqdm(total=total_frames)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        raw_frames_buffer.append(frame)
+
+        # Pure OpenCV preprocessing
+        if frame.shape[1] != 960 or frame.shape[0] != 540:
+            frame_resized = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
+        else:
+            frame_resized = frame
+
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        input_np = frame_rgb.astype(np.float32) / 255.0
+        input_np = np.transpose(input_np, (2, 0, 1))
+        
+        frames_buffer.append(torch.from_numpy(input_np))
+
+        if len(frames_buffer) == batch_size:
+            process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
+            pbar.update(batch_size)
+            frames_buffer.clear()
+            raw_frames_buffer.clear()
+
+    if len(frames_buffer) > 0:
+        process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
+        pbar.update(len(frames_buffer))
+
+    cap.release()
+    if out:
+        out.release()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights_kp", type=str, required=True, help="Path to PyTorch keypoint weights")
+    parser.add_argument("--weights_line", type=str, required=True, help="Path to PyTorch line weights")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of frames to process at once")
+    parser.add_argument("--kp_threshold", type=float, default=0.3434)
+    parser.add_argument("--line_threshold", type=float, default=0.7867)
+    parser.add_argument("--pnl_refine", action="store_true")
+    parser.add_argument("--input_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, default="")
+    args = parser.parse_args()
+
+    device = torch.device("cuda:0")
+
+    cfg = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
+    cfg_l = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
+
+    print("Loading PyTorch Models to GPU in FP16...")
+    model_kp = get_cls_net(cfg).to(device).half()
+    model_kp.load_state_dict(torch.load(args.weights_kp, map_location=device))
+    model_kp.eval()
+
+    model_line = get_cls_net_l(cfg_l).to(device).half()
+    model_line.load_state_dict(torch.load(args.weights_line, map_location=device))
+    model_line.eval()
+    print("Models Loaded. Starting Batch Processing!")
+
+    process_video(args.input_path, args.save_path, model_kp, model_line, args.kp_threshold, args.line_threshold, args.pnl_refine, device, args.batch_size)
