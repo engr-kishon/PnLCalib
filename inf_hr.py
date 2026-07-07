@@ -93,7 +93,7 @@ def draw_pitch_template(width=1050, height=680):
     return pitch
 
 
-def generate_top_down_view(frame, P, pitch_width=1050, pitch_height=680):
+def generate_top_down_view(P, pitch_width=1050, pitch_height=680):
     H = np.zeros((3, 3))
     H[:, 0] = P[:, 0]
     H[:, 1] = P[:, 1]
@@ -114,24 +114,14 @@ def generate_top_down_view(frame, P, pitch_width=1050, pitch_height=680):
         [0, 0, 1]
     ])
     
-    # Final Transformation: Invert -> Scale up -> Shift to center
+    # We calculate the final matrix so you have it ready to map players later!
     H_inv = np.linalg.inv(H)
     H_final = shift_matrix @ scale_matrix @ H_inv
 
-    # Generate the pristine 2D pitch template
+    # Generate the pristine 2D pitch template WITHOUT warping the video frame onto it
     tactical_map = draw_pitch_template(pitch_width, pitch_height)
-
-    # Warp the broadcast frame and lay it transparently over the pitch map
-    top_down_frame = cv2.warpPerspective(
-        frame, 
-        H_final, 
-        (pitch_width, pitch_height), 
-        dst=tactical_map,                 # Draw ON TOP of our new pitch template
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_TRANSPARENT # Keeps the rest of the pitch template visible
-    )
     
-    return top_down_frame
+    return tactical_map, H_final
 
 
 def process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out):
@@ -162,10 +152,10 @@ def process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, k
             # Broadcast feed with 3D lines
             projected_frame = project(raw_frame.copy(), P)
             
-            # Flat 2D tactical map
-            top_down_view = generate_top_down_view(raw_frame, P)
+            # Flat 2D tactical map (Clean pitch, no warped video)
+            top_down_view, H_final = generate_top_down_view(P)
             
-            # Match heights and stitch together
+            # Match heights and stitch together side-by-side
             h1, w1 = projected_frame.shape[:2]
             h2, w2 = top_down_view.shape[:2]
             scaling_factor = h1 / h2
@@ -220,12 +210,14 @@ def process_video(input_path, save_path, model_kp, model_line, kp_threshold, lin
         
         frames_buffer.append(torch.from_numpy(input_np))
 
+        # Process when batch is full
         if len(frames_buffer) == batch_size:
             process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
             pbar.update(batch_size)
             frames_buffer.clear()
             raw_frames_buffer.clear()
 
+    # Process remaining frames
     if len(frames_buffer) > 0:
         process_batch(cam, frames_buffer, raw_frames_buffer, model_kp, model_line, kp_threshold, line_threshold, pnl_refine, device, out)
         pbar.update(len(frames_buffer))
@@ -249,6 +241,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda:0")
 
+    # Load configs and original PyTorch weights
     cfg = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48.yaml", 'r'))
     cfg_l = yaml.safe_load(open("/root/PnLCalib/config/hrnetv2_w48_l.yaml", 'r'))
 
